@@ -1,0 +1,240 @@
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -574,6 +574,52 @@
+ #define __node_2_se(node) \
+ 	rb_entry((node), struct sched_entity, run_node)
+ 
++/* An ordinary group containing only idle work is idle work too. */
++static bool entity_has_only_idle_work(struct sched_entity *se)
++{
++	struct cfs_rq *child = group_cfs_rq(se);
++
++	if (se_is_idle(se))
++		return true;
++
++	return child && child->h_nr_queued == child->idle_h_nr_running;
++}
++
++static bool strict_idle_mixed(struct cfs_rq *cfs_rq)
++{
++	return sched_feat(IDLE_ZERO_WEIGHT) && cfs_rq->idle_h_nr_running &&
++	       cfs_rq->h_nr_queued > cfs_rq->idle_h_nr_running;
++}
++
++static void nonidle_vruntime(struct cfs_rq *cfs_rq, s64 *avg, long *load)
++{
++	struct sched_entity *curr = cfs_rq->curr, *se;
++	struct rb_node *node;
++
++	*avg = 0;
++	*load = 0;
++	if (curr && curr->on_rq && !entity_has_only_idle_work(curr)) {
++		unsigned long weight = scale_load_down(curr->load.weight);
++
++		*avg += entity_key(cfs_rq, curr) * weight;
++		*load += weight;
++	}
++
++	for (node = rb_first_cached(&cfs_rq->tasks_timeline); node;
++	     node = rb_next(node)) {
++		unsigned long weight;
++
++		se = __node_2_se(node);
++		if (entity_has_only_idle_work(se))
++			continue;
++		weight = scale_load_down(se->load.weight);
++		*avg += entity_key(cfs_rq, se) * weight;
++		*load += weight;
++	}
++}
++
++static void rebase_idle_entities(struct cfs_rq *cfs_rq, u64 vruntime);
++
+ /*
+  * Compute virtual time from the per-task service numbers:
+  *
+@@ -679,6 +725,22 @@
+ 	struct sched_entity *curr = cfs_rq->curr;
+        long weight = cfs_rq->avg_load;
+        s64 delta = 0;
++
++	/* Starved idle entities must not pull new normal work into the past. */
++	if (strict_idle_mixed(cfs_rq)) {
++		s64 runtime;
++		long load;
++
++		nonidle_vruntime(cfs_rq, &runtime, &load);
++		if (load) {
++			if (runtime < 0)
++				runtime -= load - 1;
++			delta = div_s64(runtime, load);
++			update_zero_vruntime(cfs_rq, delta);
++			rebase_idle_entities(cfs_rq, cfs_rq->zero_vruntime);
++			return cfs_rq->zero_vruntime;
++		}
++	}
+ 
+        if (curr && !curr->on_rq)
+                curr = NULL;
+@@ -766,6 +828,14 @@
+ 	s64 avg = cfs_rq->avg_vruntime;
+ 	long load = cfs_rq->avg_load;
+ 
++	if (strict_idle_mixed(cfs_rq)) {
++		nonidle_vruntime(cfs_rq, &avg, &load);
++		if (load)
++			return avg >= (s64)(vruntime - cfs_rq->zero_vruntime) * load;
++		avg = cfs_rq->avg_vruntime;
++		load = cfs_rq->avg_load;
++	}
++
+ 	if (curr && curr->on_rq) {
+ 		unsigned long weight = scale_load_down(curr->load.weight);
+ 
+@@ -864,6 +934,45 @@
+ 	avg_vruntime_sub(cfs_rq, se);
+ }
+ 
++/*
++ * Zero service must not accumulate an unbounded virtual-time debt. Advance
++ * waiting idle entities with normal virtual time, preserving their relative
++ * deadline. Besides avoiding catch-up bursts when the feature is disabled,
++ * this keeps the ordinary aggregate arithmetic bounded during starvation.
++ */
++static void rebase_idle_entities(struct cfs_rq *cfs_rq, u64 vruntime)
++{
++	struct sched_entity *curr = cfs_rq->curr, *se;
++	struct rb_node *node, *next;
++	s64 delta;
++
++	if (curr && curr->on_rq && entity_has_only_idle_work(curr)) {
++		delta = (s64)(vruntime - curr->vruntime);
++		if (delta > 0) {
++			curr->vruntime += delta;
++			curr->deadline += delta;
++		}
++	}
++
++	for (node = rb_first_cached(&cfs_rq->tasks_timeline); node; node = next) {
++		next = rb_next(node);
++		se = __node_2_se(node);
++		if (!entity_has_only_idle_work(se))
++			continue;
++		delta = (s64)(vruntime - se->vruntime);
++		if (delta <= 0)
++			continue;
++		__dequeue_entity(cfs_rq, se);
++		se->vruntime += delta;
++		se->deadline += delta;
++		__enqueue_entity(cfs_rq, se);
++		/*
++		 * Deadlines only move forward. A reinserted node encountered
++		 * again is already at @vruntime, so traversal still terminates.
++		 */
++	}
++}
++
+ struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq)
+ {
+ 	struct rb_node *root = cfs_rq->tasks_timeline.rb_root.rb_node;
+@@ -902,6 +1011,55 @@
+ {
+ 	if (protect_slice(se))
+ 		se->vlag = se->deadline + 1;
++}
++
++/*
++ * Experimental strict idle policy. Keep positive arithmetic weights, but
++ * select EEVDF only among non-idle entities when both kinds are queued.
++ *
++ * Recompute their virtual-time average: the ordinary average includes idle
++ * entities, which can be arbitrarily far behind after being starved. Using
++ * it could make every non-idle entity ineligible. The current entity is not
++ * in the tree and must participate separately.
++ *
++ * This deliberately uses an O(n) scan rather than adding another augmented
++ * tree. It runs only with IDLE_ZERO_WEIGHT enabled and a mixed runqueue.
++ * Delayed entities remain candidates so pick_next_entity() can dequeue them.
++ */
++static struct sched_entity *pick_nonidle_eevdf(struct cfs_rq *cfs_rq)
++{
++	struct sched_entity *curr = cfs_rq->curr, *se, *best = NULL;
++	struct rb_node *node;
++	s64 avg = 0;
++	long load = 0;
++
++	if (curr && (!curr->on_rq || entity_has_only_idle_work(curr)))
++		curr = NULL;
++
++	nonidle_vruntime(cfs_rq, &avg, &load);
++
++	if (!load)
++		return NULL;
++
++	if (curr && avg >= entity_key(cfs_rq, curr) * load) {
++		if (sched_feat(RUN_TO_PARITY) && protect_slice(curr))
++			return curr;
++		best = curr;
++	}
++
++	/* The tree is ordered by deadline, so its first eligible entity wins. */
++	for (node = rb_first_cached(&cfs_rq->tasks_timeline); node;
++	     node = rb_next(node)) {
++		se = __node_2_se(node);
++		if (entity_has_only_idle_work(se) ||
++		    avg < entity_key(cfs_rq, se) * load)
++			continue;
++		if (!best || entity_before(se, best))
++			best = se;
++		break;
++	}
++
++	return best;
+ }
+ 
+ /*
+@@ -929,6 +1087,12 @@
+ 	struct sched_entity *se = __pick_first_entity(cfs_rq);
+ 	struct sched_entity *curr = cfs_rq->curr;
+ 	struct sched_entity *best = NULL;
++
++	if (strict_idle_mixed(cfs_rq)) {
++		best = pick_nonidle_eevdf(cfs_rq);
++		if (best)
++			return best;
++	}
+ 
+ 	/*
+ 	 * We can safely skip eligibility check if there is only one entity
+@@ -5670,7 +5834,7 @@
+ 	/*
+ 	 * Picking the ->next buddy will affect latency but not fairness.
+ 	 */
+-	if (sched_feat(PICK_BUDDY) &&
++	if (sched_feat(PICK_BUDDY) && !sched_feat(IDLE_ZERO_WEIGHT) &&
+ 	    cfs_rq->next && entity_eligible(cfs_rq, cfs_rq->next)) {
+ 		/* ->next will never be delayed */
+ 		SCHED_WARN_ON(cfs_rq->next->sched_delayed);
+@@ -8903,6 +9067,10 @@
+ 
+ 	cse_is_idle = se_is_idle(se);
+ 	pse_is_idle = se_is_idle(pse);
++	if (sched_feat(IDLE_ZERO_WEIGHT)) {
++		cse_is_idle = entity_has_only_idle_work(se);
++		pse_is_idle = entity_has_only_idle_work(pse);
++	}
+ 
+ 	/*
+ 	 * Preempt an idle entity in favor of a non-idle entity (and don't preempt
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -18,6 +18,9 @@
+  * 0-lag point or until is has exhausted it's slice.
+  */
+ SCHED_FEAT(RUN_TO_PARITY, true)
++
++/* Give idle-policy work no service while non-idle fair work is queued. */
++SCHED_FEAT(IDLE_ZERO_WEIGHT, false)
+ /*
+  * Allow wakeup of tasks with a shorter slice to cancel RESPECT_SLICE for
+  * current.

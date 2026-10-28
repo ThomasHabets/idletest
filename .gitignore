@@ -1,0 +1,8 @@
+/idletest
+
+# Kernel build and VM test outputs
+/kernel-patch/*.log
+/kernel-patch/packages/
+/kernel-patch/test-initramfs.cpio.gz
+/kernel-patch/vm-test-init
+/kernel-patch/vmlinuz-*
