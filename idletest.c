@@ -117,7 +117,7 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    /* "Normal" spinning thread (actually SCHED_FIFO here), pinned to CPU 0 */
+    /* "Normal" spinning thread (or SCHED_FIFO), pinned to CPU 0 */
     pin_to_cpu0();
     //set_sched_fifo();
     printf("Normal thread running on CPU 0\n");
