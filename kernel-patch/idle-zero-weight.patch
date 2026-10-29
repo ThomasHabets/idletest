@@ -1,24 +1,223 @@
+--- a/include/linux/entry-common.h
++++ b/include/linux/entry-common.h
+@@ -112,6 +112,7 @@
+ 	user_exit_irqoff();
+ 
+ 	instrumentation_begin();
++	WRITE_ONCE(current->sched_idle_user, false);
+ 	kmsan_unpoison_entry_regs(regs);
+ 	trace_hardirqs_off_finish();
+ 	instrumentation_end();
+@@ -320,13 +321,41 @@
+ 
+ 	lockdep_assert_irqs_disabled();
+ 
+-	/* Flush pending rcuog wakeup before the last need_resched() check */
+-	tick_nohz_user_enter_prepare();
+-
+-	ti_work = read_thread_flags();
+-	if (unlikely(ti_work & EXIT_TO_USER_MODE_WORK))
+-		ti_work = exit_to_user_mode_loop(regs, ti_work);
+-
++	for (;;) {
++		/* Flush pending rcuog wakeup before the last need_resched() check */
++		tick_nohz_user_enter_prepare();
++
++		ti_work = read_thread_flags();
++		if (unlikely(ti_work & EXIT_TO_USER_MODE_WORK))
++			ti_work = exit_to_user_mode_loop(regs, ti_work);
++
++		/* Kernel work must be complete before strict idle starvation. */
++		kmap_assert_nomap();
++		lockdep_assert_irqs_disabled();
++		lockdep_sys_exit();
++
++		/*
++		 * All syscall, fault and return work is finished and no kernel locks
++		 * remain held. Only here may strict idle scheduling suspend us until
++		 * non-idle work blocks. Restore kernel eligibility before processing
++		 * work queued while we slept, then repeat the complete exit checks.
++		 */
++		WRITE_ONCE(current->sched_idle_user, true);
++		if (!sched_idle_user_return()) {
++			/* A remote notification may have arrived during the check. */
++			if (unlikely(read_thread_flags() & EXIT_TO_USER_MODE_WORK)) {
++				WRITE_ONCE(current->sched_idle_user, false);
++				continue;
++			}
++			break;
++		}
++		local_irq_enable_exit_to_user(ti_work);
++		schedule();
++		local_irq_disable_exit_to_user();
++		WRITE_ONCE(current->sched_idle_user, false);
++	}
++
++	/* Architecture finalization must run only after the last schedule(). */
+ 	arch_exit_to_user_mode_prepare(regs, ti_work);
+ 
+ 	/* Ensure that kernel state is sane for a return to userspace */
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -316,6 +316,7 @@
+ extern long schedule_timeout_uninterruptible(long timeout);
+ extern long schedule_timeout_idle(long timeout);
+ asmlinkage void schedule(void);
++extern bool sched_idle_user_return(void);
+ extern void schedule_preempt_disabled(void);
+ asmlinkage void preempt_schedule_irq(void);
+ #ifdef CONFIG_PREEMPT_RT
+@@ -828,6 +829,8 @@
+ 	int				wake_cpu;
+ #endif
+ 	int				on_rq;
++	/* True only in userspace or at the lock-free user-return gate. */
++	bool				sched_idle_user;
+ 
+ 	int				prio;
+ 	int				static_prio;
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -4445,6 +4445,7 @@
+ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
+ {
+ 	p->on_rq			= 0;
++	p->sched_idle_user		= false;
+ 
+ 	p->se.on_rq			= 0;
+ 	p->se.exec_start		= 0;
 --- a/kernel/sched/fair.c
 +++ b/kernel/sched/fair.c
-@@ -574,6 +574,52 @@
+@@ -48,6 +48,9 @@
+ #include <linux/ratelimit.h>
+ #include <linux/task_work.h>
+ #include <linux/rbtree_augmented.h>
++#ifdef CONFIG_GENERIC_ENTRY
++#include <linux/entry-common.h>
++#endif
+ 
+ #include <asm/switch_to.h>
+ 
+@@ -574,6 +577,153 @@
  #define __node_2_se(node) \
  	rb_entry((node), struct sched_entity, run_node)
  
-+/* An ordinary group containing only idle work is idle work too. */
++static bool idle_user_can_starve(struct task_struct *p)
++{
++#ifdef CONFIG_GENERIC_ENTRY
++	unsigned long work = EXIT_TO_USER_MODE_WORK & ~_TIF_NEED_RESCHED;
++
++	return READ_ONCE(p->sched_idle_user) &&
++	       !(read_task_thread_flags(p) & work) && !task_work_pending(p);
++#else
++	/* Missing entry instrumentation must fail open, never starve kernel work. */
++	return false;
++#endif
++}
++
++static bool entity_is_background(struct sched_entity *se)
++{
++	for_each_sched_entity(se) {
++		if (se_is_idle(se))
++			return true;
++	}
++	return false;
++}
++
++/*
++ * Walk descendants without recursion: a kernel-mode leaf exempts its whole
++ * path, even under cpu.idle=1. Native idle counts cannot express this state.
++ */
 +static bool entity_has_only_idle_work(struct sched_entity *se)
 +{
-+	struct cfs_rq *child = group_cfs_rq(se);
++	struct sched_entity *root = se;
++	struct cfs_rq *child, *cfs_rq;
++	struct rb_node *node;
 +
-+	if (se_is_idle(se))
-+		return true;
++	for (;;) {
++		/* Let pick_next_entity() finish delayed dequeues. */
++		if (se->sched_delayed)
++			return false;
++		child = group_cfs_rq(se);
++		if (child) {
++			if (child->curr && child->curr->on_rq) {
++				se = child->curr;
++				continue;
++			}
++			node = rb_first_cached(&child->tasks_timeline);
++			if (!node)
++				return false;
++			se = __node_2_se(node);
++			continue;
++		}
++		if (!entity_is_background(se) || !idle_user_can_starve(task_of(se)))
++			return false;
 +
-+	return child && child->h_nr_queued == child->idle_h_nr_running;
++		for (;;) {
++			if (se == root)
++				return true;
++			cfs_rq = cfs_rq_of(se);
++			if (se == cfs_rq->curr)
++				node = rb_first_cached(&cfs_rq->tasks_timeline);
++			else
++				node = rb_next(&se->run_node);
++			if (node) {
++				se = __node_2_se(node);
++				break;
++			}
++			se = parent_entity(se);
++		}
++	}
 +}
 +
 +static bool strict_idle_mixed(struct cfs_rq *cfs_rq)
 +{
-+	return sched_feat(IDLE_ZERO_WEIGHT) && cfs_rq->idle_h_nr_running &&
-+	       cfs_rq->h_nr_queued > cfs_rq->idle_h_nr_running;
++	struct sched_entity *curr = cfs_rq->curr;
++	struct rb_node *node;
++	bool idle = false, other = false;
++
++	if (!sched_feat(IDLE_ZERO_WEIGHT))
++		return false;
++	if (curr && curr->on_rq) {
++		idle = entity_has_only_idle_work(curr);
++		other = !idle;
++	}
++	for (node = rb_first_cached(&cfs_rq->tasks_timeline); node;
++	     node = rb_next(node)) {
++		if (entity_has_only_idle_work(__node_2_se(node)))
++			idle = true;
++		else
++			other = true;
++		if (idle && other)
++			return true;
++	}
++	return false;
++}
++
++/* Called with IRQs disabled after all generic user-return work is finished. */
++bool sched_idle_user_return(void)
++{
++	struct task_struct *p = current;
++	struct sched_entity *se;
++	struct rq_flags rf;
++	struct rq *rq;
++	bool defer = false;
++
++	if (!sched_feat(IDLE_ZERO_WEIGHT) || p->sched_class != &fair_sched_class)
++		return false;
++
++	rq = this_rq();
++	rq_lock_irqsave(rq, &rf);
++	se = &p->se;
++	for_each_sched_entity(se) {
++		if (entity_has_only_idle_work(se) && strict_idle_mixed(cfs_rq_of(se))) {
++			resched_curr(rq);
++			defer = true;
++			break;
++		}
++	}
++	rq_unlock_irqrestore(rq, &rf);
++	return defer;
 +}
 +
 +static void nonidle_vruntime(struct cfs_rq *cfs_rq, s64 *avg, long *load)
@@ -53,7 +252,7 @@
  /*
   * Compute virtual time from the per-task service numbers:
   *
-@@ -679,6 +725,22 @@
+@@ -679,6 +829,22 @@
  	struct sched_entity *curr = cfs_rq->curr;
         long weight = cfs_rq->avg_load;
         s64 delta = 0;
@@ -76,7 +275,7 @@
  
         if (curr && !curr->on_rq)
                 curr = NULL;
-@@ -766,6 +828,14 @@
+@@ -766,6 +932,14 @@
  	s64 avg = cfs_rq->avg_vruntime;
  	long load = cfs_rq->avg_load;
  
@@ -91,7 +290,7 @@
  	if (curr && curr->on_rq) {
  		unsigned long weight = scale_load_down(curr->load.weight);
  
-@@ -864,6 +934,45 @@
+@@ -864,6 +1038,45 @@
  	avg_vruntime_sub(cfs_rq, se);
  }
  
@@ -137,7 +336,7 @@
  struct sched_entity *__pick_root_entity(struct cfs_rq *cfs_rq)
  {
  	struct rb_node *root = cfs_rq->tasks_timeline.rb_root.rb_node;
-@@ -902,6 +1011,55 @@
+@@ -902,6 +1115,55 @@
  {
  	if (protect_slice(se))
  		se->vlag = se->deadline + 1;
@@ -193,7 +392,7 @@
  }
  
  /*
-@@ -929,6 +1087,12 @@
+@@ -929,6 +1191,12 @@
  	struct sched_entity *se = __pick_first_entity(cfs_rq);
  	struct sched_entity *curr = cfs_rq->curr;
  	struct sched_entity *best = NULL;
@@ -206,7 +405,7 @@
  
  	/*
  	 * We can safely skip eligibility check if there is only one entity
-@@ -5670,7 +5834,7 @@
+@@ -5670,7 +5938,7 @@
  	/*
  	 * Picking the ->next buddy will affect latency but not fairness.
  	 */
@@ -215,7 +414,7 @@
  	    cfs_rq->next && entity_eligible(cfs_rq, cfs_rq->next)) {
  		/* ->next will never be delayed */
  		SCHED_WARN_ON(cfs_rq->next->sched_delayed);
-@@ -8903,6 +9067,10 @@
+@@ -8903,6 +9171,10 @@
  
  	cse_is_idle = se_is_idle(se);
  	pse_is_idle = se_is_idle(pse);

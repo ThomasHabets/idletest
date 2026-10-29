@@ -10,7 +10,7 @@
 -UNINLINE_SPIN_UNLOCK y
  CC_VERSION_TEXT "x86_64-linux-gnu-gcc-14 (Debian 14.2.0-19) 14.2.0" -> "gcc (Debian 14.2.0-19) 14.2.0"
  DEBUG_INFO_BTF y -> n
- LOCALVERSION "" -> "-idle-zero"
+ LOCALVERSION "" -> "-idle-user"
  RUSTC_LLVM_VERSION 0 -> 230101
  RUSTC_VERSION 0 -> 109901
 +BUILD_SALT ""

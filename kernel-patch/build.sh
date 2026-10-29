@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 task_dir=$(cd -- "$(dirname -- "$0")" && pwd)
-kernel_tree=${1:-"$task_dir/../../linux-idle-zero-rebuild"}
+kernel_tree=${1:-"$task_dir/../../linux-idle-user-rebuild"}
 source_archive=${2:-/usr/src/linux-source-6.12.tar.xz}
 jobs=${JOBS:-10}
 if [[ -e "$kernel_tree" ]]; then
@@ -33,5 +33,5 @@ patch -p1 < "$task_dir/idle-zero-weight.patch"
 cp "$task_dir/kernel.config" .config
 make olddefconfig
 DEB_BUILD_PROFILES=pkg.linux-upstream.nokerneldbg \
-    make -j"$jobs" bindeb-pkg KDEB_PKGVERSION=6.12.111-1 \
+    make -j"$jobs" bindeb-pkg KDEB_PKGVERSION=6.12.111-2 \
         KBUILD_BUILD_VERSION=1 CFLAGS_MODULE=-g0
